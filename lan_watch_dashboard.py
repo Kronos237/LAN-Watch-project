@@ -96,6 +96,34 @@ def scan_wifi_network(ip_range):
         st.error(f"Wi-Fi Scan Error: {e}")
         return []
 
+def scan_available_wifi_networks():
+    """
+    Lists nearby Wi-Fi networks (SSIDs) through the Windows WLAN service.
+    This is separate from the ARP scan, which finds devices on the connected LAN.
+    """
+    if platform.system() != "Windows":
+        st.warning("Nearby Wi-Fi network scanning is currently supported on Windows only.")
+        return []
+
+    try:
+        output = subprocess.run(
+            ["netsh", "wlan", "show", "networks", "mode=bssid"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        ).stdout
+        networks = []
+        for match in re.finditer(r"^\s*SSID\s+\d+\s*:\s*(.*)$", output, re.MULTILINE):
+            ssid = match.group(1).strip()
+            if ssid and ssid not in networks:
+                networks.append(ssid)
+        return networks
+    except (OSError, subprocess.CalledProcessError) as e:
+        st.error(f"Nearby Wi-Fi scan error: {e}")
+        return []
+
 def enrich_wifi_devices_with_hostname(clients_list, progress_placeholder):
     """
     Goes through the list of Wi-Fi devices and tries to find their hostname.
@@ -314,6 +342,8 @@ if 'scan_run' not in st.session_state:
     st.session_state.scan_run = False
 if 'wifi_results' not in st.session_state:
     st.session_state.wifi_results = []
+if 'wifi_networks' not in st.session_state:
+    st.session_state.wifi_networks = []
 if 'bt_results' not in st.session_state:
     st.session_state.bt_results = []
 
@@ -344,8 +374,12 @@ if not st.session_state.scan_run:
             
             # We need a placeholder for the progress bar inside the status
             wifi_progress_placeholder = st.empty()
-            
+
             with st.status("Scanning Wi-Fi...", expanded=True) as status:
+                st.write("Finding nearby Wi-Fi networks...")
+                nearby_wifi_networks = scan_available_wifi_networks()
+                st.session_state.wifi_networks = nearby_wifi_networks
+                st.write(f"Found {len(nearby_wifi_networks)} nearby networks.")
                 st.write("Finding network range...")
                 target_range = get_local_network_range_windows()
                 if not target_range:
@@ -363,7 +397,7 @@ if not st.session_state.scan_run:
                 
                 # Save results to session state
                 st.session_state.wifi_results = enriched_wifi
-                status.update(label=f"Wi-Fi Scan Complete ({len(enriched_wifi)} devices found)", state="complete", expanded=False)
+                status.update(label=f"Wi-Fi Scan Complete ({len(nearby_wifi_networks)} networks, {len(enriched_wifi)} devices)", state="complete", expanded=False)
             
             with st.status("Scanning Bluetooth...", expanded=True) as status:
                 st.write("Looking for discoverable Bluetooth devices...")
@@ -382,7 +416,14 @@ if st.session_state.scan_run:
     st.success("Scan Complete!")
 
     # --- Display the Results in Tables ---
-    st.subheader("Wi-Fi Network Devices")
+    st.subheader("Nearby Wi-Fi Networks")
+    if st.session_state.wifi_networks:
+        wifi_network_df = pd.DataFrame({"SSID": st.session_state.wifi_networks})
+        st.dataframe(wifi_network_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No nearby Wi-Fi networks found.")
+
+    st.subheader("Devices on Connected Wi-Fi/LAN")
     if st.session_state.wifi_results:
         wifi_df = pd.DataFrame(st.session_state.wifi_results)
         wifi_df = wifi_df.reindex(columns=['ip', 'mac', 'name'])
@@ -405,5 +446,6 @@ if st.session_state.scan_run:
         # Reset the state and rerun the script
         st.session_state.scan_run = False
         st.session_state.wifi_results = []
+        st.session_state.wifi_networks = []
         st.session_state.bt_results = []
         st.rerun()

@@ -1,10 +1,11 @@
 # 📡 LAN Watch: Advanced Network & Bluetooth Scanner
 
-**LAN Watch** is a dual-interface network discovery tool designed to bridge the gap between theoretical networking and practical application. It combines low-level **ARP packet crafting** for Wi-Fi discovery with asynchronous **Bluetooth Low Energy (BLE)** scanning, providing real-time visibility into your local environment.
+**LAN Watch** is a dual-interface network discovery tool designed to bridge the gap between theoretical networking and practical application. It lists nearby Wi-Fi networks (SSIDs), uses low-level **ARP packet crafting** to find devices on the connected LAN, and performs asynchronous **Bluetooth Low Energy (BLE)** scanning.
 
 
 ## 🚀 Key Features
-* **📶 Universal Device Discovery:** Uses raw **ARP (Address Resolution Protocol)** packets to identify all active devices on the local Wi-Fi subnet (IP & MAC addresses).
+* **📶 Nearby Wi-Fi Discovery:** Lists nearby wireless networks (SSIDs) using the Windows WLAN service.
+* **🖥️ LAN Device Discovery:** Uses raw **ARP (Address Resolution Protocol)** packets to identify active devices on the connected Wi-Fi subnet (IP & MAC addresses).
 * **🔵 Bluetooth Scanning:** Integrated **Bleak** library to asynchronously detect nearby BLE peripherals (Headphones, IoT, Wearables).
 * **🏷️ Smart Hostname Resolution:** Automatically performs **Reverse DNS lookups** to resolve IP addresses to human-readable device names (e.g., "Desktop-PC", "iPhone").
 * **🖥️ Dual-Mode Interface:**
@@ -45,8 +46,8 @@ python lan_watch_scanner.py
 **1. Clone the Repository**
 
 ```bash
-git clone [https://github.com/Devindot/LAN-Watch.git](https://github.com/Devindot/LAN-Watch.git)
-cd LAN-Watch
+git clone https://github.com/Kronos237/LAN-Watch-project.git
+cd LAN-Watch-project
 
 ```
 
@@ -62,9 +63,10 @@ pip install -r requirements.txt
 ## 🧠 How It Works
 
 1. **Range Detection:** The script executes system commands (e.g., `ipconfig`) to parse the active IPv4 address and Subnet Mask.
-2. **ARP Broadcasting:** It constructs a custom ARP Request packet ("Who has this IP?") and broadcasts it to the entire subnet (`ff:ff:ff:ff:ff:ff`). Active devices reply with their MAC address.
-3. **Bluetooth Sniffing:** Concurrently, the `BleakScanner` listens for BLE advertisement packets to find nearby wireless peripherals.
-4. **Enrichment:** The system queries the local DNS resolver to find the Hostname associated with each discovered IP.
+2. **Wi-Fi Radio Scan:** On Windows, it runs `netsh wlan show networks mode=bssid` to list nearby SSIDs.
+3. **ARP Broadcasting:** It constructs a custom ARP Request packet ("Who has this IP?") and broadcasts it to the connected subnet (`ff:ff:ff:ff:ff:ff`). Active devices reply with their MAC address.
+4. **Bluetooth Sniffing:** The `BleakScanner` listens for BLE advertisement packets to find nearby wireless peripherals.
+5. **Enrichment:** The system queries the local DNS resolver to find the Hostname associated with each discovered IP.
 
 ## 🔮 Future Roadmap
 
@@ -74,4 +76,3 @@ pip install -r requirements.txt
 
 
 ---
-

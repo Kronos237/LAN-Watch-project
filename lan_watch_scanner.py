@@ -3,7 +3,7 @@
 """
 LAN Watch: Advanced Network Scanner
 Version 3.0
-Scans for Wi-Fi (ARP) and Bluetooth (BLE) devices.
+Scans for nearby Wi-Fi networks, LAN devices (ARP), and Bluetooth (BLE) devices.
 Tries to find the Wi-Fi device Hostname using a Reverse DNS Lookup.
 """
 
@@ -115,6 +115,37 @@ def scan_wifi_network(ip_range):
     except Exception as e:
         print(f"\n[!] An error occurred during the Wi-Fi scan: {e}")
         print("[!] Please ensure Npcap is installed (on Windows) and the script is run as Administrator.")
+        return []
+
+def scan_available_wifi_networks():
+    """
+    Lists nearby Wi-Fi networks (SSIDs) using the Windows WLAN service.
+    This is different from the ARP scan above, which finds devices on the
+    currently connected LAN.
+    """
+    if platform.system() != "Windows":
+        print("[!] Nearby Wi-Fi network scanning is currently supported on Windows only.")
+        return []
+
+    try:
+        output = subprocess.run(
+            ["netsh", "wlan", "show", "networks", "mode=bssid"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        ).stdout
+        networks = []
+        for match in re.finditer(r"^\s*SSID\s+\d+\s*:\s*(.*)$", output, re.MULTILINE):
+            ssid = match.group(1).strip()
+            if ssid and ssid not in networks:
+                networks.append(ssid)
+        print(f"[*] Nearby Wi-Fi scan complete. Found {len(networks)} networks.")
+        return networks
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(f"\n[!] Could not scan nearby Wi-Fi networks: {e}")
+        print("[!] Ensure the Wi-Fi adapter is enabled and the WLAN service is running.")
         return []
 
 def get_device_hostname(ip_address, results_dict):
@@ -321,6 +352,18 @@ def display_bluetooth_results(clients_list):
             
     print(bottom_border)
 
+def display_available_wifi_results(networks):
+    """Prints the nearby Wi-Fi network names detected by the wireless adapter."""
+    print("\n" + "=" * 50)
+    print(f"Nearby Wi-Fi Networks ({len(networks)})")
+    print("=" * 50)
+    if not networks:
+        print("No nearby Wi-Fi networks found.")
+    else:
+        for index, ssid in enumerate(networks, start=1):
+            print(f"{index:>3}. {ssid}")
+    print("=" * 50)
+
 
 # --- 5. Main Function ---
 
@@ -336,7 +379,10 @@ async def main():
     else:
         print("[+] Administrator check passed.")
         
-    # --- Step 2: Find Wi-Fi Network ---
+    # --- Step 2: Find nearby Wi-Fi networks and the connected LAN ---
+    nearby_wifi_networks = scan_available_wifi_networks()
+    display_available_wifi_results(nearby_wifi_networks)
+
     print("[+] Attempting to find network range automatically...")
     
     if platform.system() == "Windows":
@@ -351,7 +397,7 @@ async def main():
     
     print(f"[+] Automatically detected network range: {target_range}")
     
-    # --- Step 3: Run Wi-Fi Scan ---
+    # --- Step 3: Run LAN device scan ---
     wifi_devices = scan_wifi_network(target_range)
     
     # --- Step 4: Enrich Wi-Fi Data (NEW: Hostname Lookup) ---
