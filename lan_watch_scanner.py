@@ -7,7 +7,7 @@ Scans for nearby Wi-Fi networks, LAN devices (ARP), and Bluetooth (BLE) devices.
 Tries to find the Wi-Fi device Hostname using a Reverse DNS Lookup.
 """
 
-# We need these libraries for the script to work
+# We need these libraaries for the script to work
 import sys
 import subprocess
 import re
@@ -51,46 +51,62 @@ def is_admin():
 
 # --- 2. Wi-Fi Scan Functions ---
 
-def get_local_network_range_windows():
+
+def get_wifi_network_info_windows():
     """
-    Finds the active network range by running 'ipconfig' and parsing it.
-    This is the most reliable method for Windows.
+    Detect the IPv4 address and subnet of the Wi-Fi adapter,
+    rather than accidentally selecting a virtual adapter.
     """
     try:
-        # Run ipconfig and capture the output
-        output = subprocess.run(["ipconfig"], capture_output=True, text=True, check=True).stdout
-        
-        # Use regex to find all IPv4 and Subnet Mask lines
-        matches = re.finditer(
-            r"IPv4 Address[.\s]+:\s*(?P<ip>\d+\.\d+\.\d+\.\d+)\s+"
-            r"Subnet Mask[.\s]+:\s*(?P<mask>\d+\.\d+\.\d+\.\d+)",
-            output
-        )
-        
-        for match in matches:
-            ip_str = match.group('ip')
-            mask_str = match.group('mask')
-            
-            # We found an active adapter, calculate its network
-            if ip_str and mask_str and not ip_str.startswith("169.254"):
-                # Use ipaddress library to calculate the network range in CIDR notation
-                ip_interface = ipaddress.ip_interface(f"{ip_str}/{mask_str}")
-                network_range = str(ip_interface.network)
-                return network_range
-                
-        # If no match was found
-        raise RuntimeError("Could not find an active IPv4 adapter (non-169.254) in 'ipconfig' output.")
-        
-    except Exception as e:
-        print(f"Error parsing ipconfig: {e}")
-        return None
+        command = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            (
+                "Get-NetIPAddress -AddressFamily IPv4 "
+                "-InterfaceAlias 'WiFi' "
+                "| Where-Object {$_.IPAddress -notlike '169.254.*'} "
+                "| Select-Object -First 1 "
+                "| ForEach-Object { "
+                '"$($_.IPAddress)/$($_.PrefixLength)" '
+                "}"
+            ),
+        ]
 
-def scan_wifi_network(ip_range):
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+
+        address = result.stdout.strip()
+
+        if not address:
+            raise RuntimeError(
+                "No IPv4 address found on the WiFi adapter."
+            )
+
+        interface = ipaddress.ip_interface(address)
+
+        return str(interface.network), str(interface.ip)
+
+    except Exception as e:
+        print(f"Error detecting Wi-Fi network: {e}")
+        return None, None
+
+
+    
+
+def scan_wifi_network(ip_range, interface):
     """
     Performs the ARP scan on the given IP range using Scapy.
     """
     print(f"[*] Starting Wi-Fi Scan (ARP) on {ip_range}...")
     try:
+        
+        
         # 1. Build the ARP request packet
         arp_request = scp.ARP(pdst=ip_range)
         
@@ -101,7 +117,15 @@ def scan_wifi_network(ip_range):
         arp_request_broadcast = broadcast_frame / arp_request
         
         # 4. Send and receive (srp) packets, with a 2-second timeout
-        answered_list = scp.srp(arp_request_broadcast, timeout=2, verbose=False)[0]
+        
+        answered_list = scp.srp(
+            arp_request_broadcast,
+            iface=interface,
+            timeout=5,
+            retry=1,
+            verbose=False,
+        )[0]
+
         
         clients_list = []
         for element in answered_list:
@@ -385,20 +409,43 @@ async def main():
 
     print("[+] Attempting to find network range automatically...")
     
+    
     if platform.system() == "Windows":
-        target_range = get_local_network_range_windows()
+        target_range, wifi_ip = get_wifi_network_info_windows()
     else:
-        print("[!] Automatic range finding for Linux/macOS not implemented in this script.")
-        target_range = None # You could hard-code "192.168.1.0/24" here for testing
+        print(
+            "[!] Automatic range finding for Linux/macOS "
+            "not implemented in this script."
+        )
+        target_range, wifi_ip = None, None
+
     
     if not target_range:
         print("[-] Could not automatically determine network range.")
         sys.exit(1)
     
     print(f"[+] Automatically detected network range: {target_range}")
+
+    
+    wifi_interface = next(
+        (
+            iface
+            for iface in scp.conf.ifaces.values()
+            if getattr(iface, "ip", None) == wifi_ip
+        ),
+        None,
+    )
+
+    if wifi_interface is None:
+        print(f"[ERROR] Could not find Scapy interface for {wifi_ip}.")
+        print("[INFO] Check the Scapy interface list and Npcap installation.")
+        sys.exit(1)
+
+    print(f"[+] Selected Wi-Fi interface: {wifi_interface.name}")
+
     
     # --- Step 3: Run LAN device scan ---
-    wifi_devices = scan_wifi_network(target_range)
+    wifi_devices = scan_wifi_network(target_range,wifi_interface)
     
     # --- Step 4: Enrich Wi-Fi Data (NEW: Hostname Lookup) ---
     enriched_wifi_devices = enrich_wifi_devices_with_hostname(wifi_devices)
