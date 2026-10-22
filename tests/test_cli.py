@@ -74,3 +74,90 @@ def test_version_is_available_without_network(monkeypatch,capsys):
         cli.main(["--version"])
     assert exit_info.value.code==0
     assert "LAN Watch 1.0" in capsys.readouterr().out
+
+
+def test_ble_table_formats_observations_and_ist_timestamp(capsys):
+    observation={"name":"Temperature Sensor","identifier":"AA:BB:CC:DD:EE:FF",
+                 "rssi":-58,"service_uuids":["0000180F-0000-1000-8000-00805F9B34FB"],
+                 "observed_at":"2026-10-22T14:54:51Z"}
+    cli.print_ble_results([observation])
+    output=capsys.readouterr().out
+    assert "=== BLE discovery ===" in output
+    assert "BLE scan complete: 1 observation(s) found." in output
+    assert "Name" in output and "Identifier" in output
+    assert "RSSI (dBm)" in output and "Advertised service UUIDs" in output
+    assert "Observation time (IST)" in output
+    assert "Temperature Sensor" in output and "-58" in output
+    assert "22 Oct 2026, 08:24:51 PM IST" in output
+
+
+def test_ble_table_uses_unknown_and_none_for_missing_fields(capsys):
+    cli.print_ble_results([{"name":None,"identifier":"BLE-ID","rssi":None,
+                            "service_uuids":[],"observed_at":None}])
+    output=capsys.readouterr().out
+    assert "Unknown" in output
+    assert "BLE-ID" in output
+    assert "None" in output
+    assert "Unavailable" in output
+
+
+def test_ble_table_truncates_long_values_only_for_display(capsys):
+    identifier="identifier-"+"x"*80
+    services=["service-"+"y"*80]
+    observation={"name":"n","identifier":identifier,"rssi":-44,
+                 "service_uuids":services,"observed_at":"2026-10-22T14:54:51+00:00"}
+    cli.print_ble_results([observation])
+    output=capsys.readouterr().out
+    assert "..." in output
+    assert identifier not in output
+    assert services[0] not in output
+    assert observation["identifier"] == identifier
+    assert observation["service_uuids"] == services
+
+
+def test_ble_empty_success_is_distinct_from_failure(capsys):
+    cli.print_ble_results([])
+    empty_output=capsys.readouterr().out
+    assert "BLE scan complete: 0 observation(s) found." in empty_output
+    assert "No BLE observations found." in empty_output
+    assert "BLE scan failed" not in empty_output
+
+    cli.print_ble_results([],"Bluetooth adapter unavailable")
+    failed_output=capsys.readouterr().out
+    assert "BLE scan failed: Bluetooth adapter unavailable" in failed_output
+    assert "found: unavailable (scan failed)" in failed_output
+
+
+def test_ble_scan_failure_does_not_abort_successful_lan_scan(monkeypatch,capsys):
+    setup_cli(monkeypatch,result())
+    async def failed_scan():
+        return [],"adapter unavailable"
+    monkeypatch.setattr(cli,"scan_ble",lambda: failed_scan())
+    assert cli.main(["--ble"])==0
+    output=capsys.readouterr().out
+    assert "Scan complete: status=success" in output
+    assert "BLE scan failed: adapter unavailable" in output
+
+
+def test_optional_discovery_sections_are_separately_headed(monkeypatch,capsys):
+    setup_cli(monkeypatch,result())
+    monkeypatch.setattr(cli,"scan_ssids",lambda: (["Example WiFi"],None))
+    async def successful_ble_scan():
+        return ([{"name":"BLE tag","identifier":"ble-1","rssi":-50,
+                  "service_uuids":[],"observed_at":"2026-10-22T14:54:51Z"}],None)
+    monkeypatch.setattr(cli,"scan_ble",successful_ble_scan)
+    assert cli.main(["--ssids","--ble"])==0
+    output=capsys.readouterr().out
+    assert output.index("=== Nearby SSIDs ===") < output.index("=== LAN scan ===")
+    assert output.index("=== LAN scan ===") < output.index("=== BLE discovery ===")
+    assert "Example WiFi" in output and "BLE tag" in output
+
+
+def test_ble_json_output_option_is_preserved(capsys):
+    observations=[{"name":None,"identifier":"ble-1","rssi":None,
+                   "service_uuids":[],"observed_at":"2026-10-22T14:54:51Z"}]
+    cli.print_ble_results(observations,json_output=True)
+    captured=capsys.readouterr()
+    assert "=== BLE discovery ===" in captured.err
+    import json
+    assert json.loads(captured.out)=={"ble_observations":observations,"error":None}

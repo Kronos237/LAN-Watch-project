@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .DS_Store
 venv/
+report_assets/
+review_pdf/
+*.docx
+*.pdf
+REPORT_NOTES.md

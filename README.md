@@ -50,6 +50,8 @@ python .\lan_watch_scanner.py --help
 python .\lan_watch_scanner.py --version
 ```
 
+With `--ble` and without `--json`, BLE results are shown in a separate aligned terminal table with name, identifier, RSSI, advertised service UUIDs, and observation time in IST. Missing names display as `Unknown`; empty service lists display as `None`. Long values are shortened only for terminal display. A successful scan with no advertisements is reported as an empty result, separately from a scan error. Use `--json --ble` to retain JSON output for both the LAN scan and BLE observations (printed as separate JSON records); the `--json` option does not change BLE discovery.
+
 Monitoring runs sequential scans until Ctrl+C and saves local history. The default interval is 60 seconds; shorter intervals are rejected. A one-shot scan does not initialize SQLite. Use `--db PATH` to choose a history database location.
 
 Scan timestamps and timestamps in SQLite and CSV/JSON data remain ISO-formatted UTC values. Human-readable timestamps in the dashboard and CLI history output are converted to **IST (Asia/Kolkata)** and labelled `IST`. Naive timestamps left by legacy data are consistently interpreted as UTC. The dashboard export preview uses IST; downloaded files keep UTC timestamps for reliable machine comparisons.

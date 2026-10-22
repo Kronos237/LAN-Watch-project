@@ -13,6 +13,53 @@ from lanwatch.storage import HistoryStore
 from lanwatch.time_formatting import format_timestamp
 
 
+_BLE_COLUMN_WIDTHS = (18, 22, 10, 36, 30)
+
+
+def _terminal_cell(value, width):
+    """Fit one display value to a column without mutating its source data."""
+    text = str(value)
+    if len(text) > width:
+        return text[:width - 3] + "..."
+    return text
+
+
+def print_ble_results(observations, error=None, json_output=False):
+    """Present existing BLE observations as a table, or retain JSON output."""
+    heading_stream = sys.stderr if json_output else sys.stdout
+    print("=== BLE discovery ===", file=heading_stream, flush=True)
+    if json_output:
+        print(json.dumps({"ble_observations": observations, "error": error}, ensure_ascii=False), flush=True)
+        return
+    if error:
+        print(f"BLE scan failed: {error}", flush=True)
+        print("BLE observations found: unavailable (scan failed)", flush=True)
+        return
+
+    count = len(observations)
+    print(f"BLE scan complete: {count} observation(s) found.", flush=True)
+    if not count:
+        print("No BLE observations found.", flush=True)
+        return
+
+    headers = ("Name", "Identifier", "RSSI (dBm)", "Advertised service UUIDs", "Observation time (IST)")
+    print(" ".join(f"{label:<{width}}" for label, width in zip(headers, _BLE_COLUMN_WIDTHS)), flush=True)
+    print(" ".join("-" * width for width in _BLE_COLUMN_WIDTHS), flush=True)
+    for observation in observations:
+        name = observation.get("name") or "Unknown"
+        identifier = observation.get("identifier") or "Unavailable"
+        rssi = observation.get("rssi")
+        rssi_text = str(rssi) if rssi is not None else "Unavailable"
+        services = observation.get("service_uuids") or []
+        if isinstance(services, str):
+            services_text = services
+        else:
+            services_text = ", ".join(str(service) for service in services) or "None"
+        observed_at = format_timestamp(observation.get("observed_at"))
+        values = (name, identifier, rssi_text, services_text, observed_at)
+        print(" ".join(f"{_terminal_cell(value, width):<{width}}" for value, width in zip(values, _BLE_COLUMN_WIDTHS)), flush=True)
+
+
 def build_parser():
     p=argparse.ArgumentParser(description="Discover devices on the configured local IPv4 LAN.")
     p.add_argument("--version", action="version", version="LAN Watch 1.0")
@@ -47,13 +94,14 @@ def main(argv=None):
         print(f"Network configuration error: {exc}",file=sys.stderr); return 2
     print(f"Interface: {config.name} ({config.address}/{config.prefix}); network {config.network}; gateway {config.gateway or 'unavailable'}", flush=True)
     if args.ssids:
-        ssids,error=scan_ssids(); print("Nearby SSIDs: "+(", ".join(ssids) if ssids else (error or "none observed")))
+        ssids,error=scan_ssids(); print("=== Nearby SSIDs ===", flush=True); print("Nearby SSIDs: "+(", ".join(ssids) if ssids else (error or "none observed")), flush=True)
     try:
         previous_macs=set()
         while True:
             try:
                 result=arp_scan(config,scapy=scapy,timeout=args.timeout)
             except Exception as exc:
+                print("=== LAN scan ===", file=sys.stderr, flush=True)
                 print(f"Scan failed: {exc}",file=sys.stderr,flush=True)
                 return 1
             if args.monitor:
@@ -69,14 +117,18 @@ def main(argv=None):
                     store.record_events(events)
                     previous_macs=current
                     for event in events: print(f"[{event['kind']}] {event['ip'] or event['mac']}: {event['detail']}")
-            if args.json: print(json.dumps(result.__dict__,default=str),flush=True)
-            elif result.status == "error": print(f"Scan failed: {result.error}",file=sys.stderr,flush=True)
+            if args.json:
+                print(json.dumps(result.__dict__,default=str),flush=True)
             else:
-                print(f"ARP scan {result.status}: {len(result.devices)} device(s) observed on {config.network}")
-                print(f"{'IP':<16} {'MAC':<18} {'HOSTNAME':<32} {'ROLE'}")
-                for d in result.devices:
-                    role="local" if d["is_local"] else "gateway" if d["is_gateway"] else "device"
-                    print(f"{d['ip']:<16} {d['mac']:<18} {(d['hostname'] or 'unavailable'):<32} {role}")
+                print("=== LAN scan ===", flush=True)
+                if result.status == "error":
+                    print(f"Scan failed: {result.error}",file=sys.stderr,flush=True)
+                else:
+                    print(f"ARP scan {result.status}: {len(result.devices)} device(s) observed on {config.network}")
+                    print(f"{'IP':<16} {'MAC':<18} {'HOSTNAME':<32} {'ROLE'}")
+                    for d in result.devices:
+                        role="local" if d["is_local"] else "gateway" if d["is_gateway"] else "device"
+                        print(f"{d['ip']:<16} {d['mac']:<18} {(d['hostname'] or 'unavailable'):<32} {role}")
             if not args.monitor:
                 print(f"Scan complete: status={result.status}; observed={len(result.devices)}; network={config.network}",flush=True)
                 break
@@ -85,8 +137,11 @@ def main(argv=None):
         print("Monitoring stopped by user.",flush=True)
         return 0
     if args.ble:
-        results,error=asyncio.run(scan_ble())
-        print(json.dumps({"ble_observations":results,"error":error},ensure_ascii=False))
+        try:
+            results,error=asyncio.run(scan_ble())
+        except Exception as exc:
+            results,error=[],str(exc)
+        print_ble_results(results,error,json_output=args.json)
     return 0 if result.status == "success" else 1
 
 
