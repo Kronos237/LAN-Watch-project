@@ -1,470 +1,94 @@
 #!/usr/bin/env python3
-
-"""
-LAN Watch: Advanced Network Scanner
-Version 3.0
-Scans for nearby Wi-Fi networks, LAN devices (ARP), and Bluetooth (BLE) devices.
-Tries to find the Wi-Fi device Hostname using a Reverse DNS Lookup.
-"""
-
-# We need these libraaries for the script to work
+"""LAN Watch lightweight command-line scanner."""
+import argparse
+import asyncio
+import json
 import sys
-import subprocess
-import re
-import ipaddress
-import ctypes
-import asyncio  # Required for the Bluetooth scan
-import socket   # For Reverse DNS (Hostname) Lookup
-import platform # To check for OS
+import time
 
-# We use 'scapy' for our Wi-Fi ARP scan
-try:
-    import scapy.all as scp
-except ImportError:
-    print("Error: Scapy library not found. Please run: pip install scapy")
-    sys.exit(1)
+from lanwatch.network import InterfaceSelectionError, select_network
+from lanwatch.scanner import arp_scan, scan_ssids
+from lanwatch.ble import scan_ble
+from lanwatch.storage import HistoryStore
+from lanwatch.time_formatting import format_timestamp
 
-# We use 'bleak' for our Bluetooth scan
-try:
-    import bleak
-except ImportError:
-    print("Error: Bleak library not found. Please run: pip install bleak")
-    sys.exit(1)
 
-# --- 1. Administrator Check ---
+def build_parser():
+    p=argparse.ArgumentParser(description="Discover devices on the configured local IPv4 LAN.")
+    p.add_argument("--version", action="version", version="LAN Watch 1.0")
+    p.add_argument("--interface", help="Interface alias/name override (auto-select active Wi-Fi otherwise).")
+    p.add_argument("--timeout", type=float, default=3, help="ARP response timeout in seconds (default: 3).")
+    p.add_argument("--json", action="store_true", help="Write scan result as JSON.")
+    p.add_argument("--ssids", action="store_true", help="Also list nearby Wi-Fi SSIDs (Windows only).")
+    p.add_argument("--ble", action="store_true", help="Also perform optional BLE discovery.")
+    p.add_argument("--monitor", action="store_true", help="Repeat scans and persist observations until Ctrl+C.")
+    p.add_argument("--interval", type=int, default=60, help="Monitoring interval in seconds (minimum 60).")
+    p.add_argument("--history", action="store_true", help="Show local scan history without scanning.")
+    p.add_argument("--db", help="Optional SQLite history path.")
+    return p
 
-def is_admin():
-    """
-    Checks if the script is running with administrator privileges.
-    This is required for ARP scanning and (on some OS) Bluetooth scanning.
-    """
+
+def main(argv=None):
+    args=build_parser().parse_args(argv)
+    store=HistoryStore(args.db)
+    if args.history:
+        for row in store.scans():
+            print(json.dumps({"id":row[0],"started_utc":row[1],"started_ist":format_timestamp(row[1]),"time_zone":"IST",
+                              "status":row[3],"network":row[4],"error":row[5]}))
+        return 0
+    if args.timeout <= 0:
+        print("Error: --timeout must be positive.",file=sys.stderr); return 2
+    if args.monitor and args.interval < 60:
+        print("Error: monitoring interval must be at least 60 seconds.",file=sys.stderr); return 2
     try:
-        if platform.system() == "Windows":
-            return ctypes.windll.shell32.IsUserAnAdmin() != 0
-        else:
-            # On Linux/macOS, check for root (UID 0)
-            import os
-            return os.geteuid() == 0
-    except Exception as e:
-        print(f"[!] Could not check admin status: {e}")
-        return False
-
-# --- 2. Wi-Fi Scan Functions ---
-
-
-def get_wifi_network_info_windows():
-    """
-    Detect the IPv4 address and subnet of the Wi-Fi adapter,
-    rather than accidentally selecting a virtual adapter.
-    """
+        import scapy.all as scapy
+        config=select_network(interface=args.interface,scapy_conf=scapy.conf)
+    except (ImportError, InterfaceSelectionError) as exc:
+        print(f"Network configuration error: {exc}",file=sys.stderr); return 2
+    print(f"Interface: {config.name} ({config.address}/{config.prefix}); network {config.network}; gateway {config.gateway or 'unavailable'}", flush=True)
+    if args.ssids:
+        ssids,error=scan_ssids(); print("Nearby SSIDs: "+(", ".join(ssids) if ssids else (error or "none observed")))
     try:
-        command = [
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            (
-                "Get-NetIPAddress -AddressFamily IPv4 "
-                "-InterfaceAlias 'WiFi' "
-                "| Where-Object {$_.IPAddress -notlike '169.254.*'} "
-                "| Select-Object -First 1 "
-                "| ForEach-Object { "
-                '"$($_.IPAddress)/$($_.PrefixLength)" '
-                "}"
-            ),
-        ]
+        previous_macs=set()
+        while True:
+            try:
+                result=arp_scan(config,scapy=scapy,timeout=args.timeout)
+            except Exception as exc:
+                print(f"Scan failed: {exc}",file=sys.stderr,flush=True)
+                return 1
+            if args.monitor:
+                store.save(result)
+                if result.status == "success":
+                    current={d.get("mac") for d in result.devices if d.get("mac")}
+                    events=[]
+                    for device in result.devices:
+                        if device.get("mac") not in previous_macs:
+                            events.append({"time":result.finished_at,"kind":"newly_observed","ip":device.get("ip"),"mac":device.get("mac"),"detail":"First observation during this monitoring session."})
+                    for mac in previous_macs-current:
+                        events.append({"time":result.finished_at,"kind":"not_observed_in_scan","ip":None,"mac":mac,"detail":"Absent from this scan; not proof of offline status."})
+                    store.record_events(events)
+                    previous_macs=current
+                    for event in events: print(f"[{event['kind']}] {event['ip'] or event['mac']}: {event['detail']}")
+            if args.json: print(json.dumps(result.__dict__,default=str),flush=True)
+            elif result.status == "error": print(f"Scan failed: {result.error}",file=sys.stderr,flush=True)
+            else:
+                print(f"ARP scan {result.status}: {len(result.devices)} device(s) observed on {config.network}")
+                print(f"{'IP':<16} {'MAC':<18} {'HOSTNAME':<32} {'ROLE'}")
+                for d in result.devices:
+                    role="local" if d["is_local"] else "gateway" if d["is_gateway"] else "device"
+                    print(f"{d['ip']:<16} {d['mac']:<18} {(d['hostname'] or 'unavailable'):<32} {role}")
+            if not args.monitor:
+                print(f"Scan complete: status={result.status}; observed={len(result.devices)}; network={config.network}",flush=True)
+                break
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("Monitoring stopped by user.",flush=True)
+        return 0
+    if args.ble:
+        results,error=asyncio.run(scan_ble())
+        print(json.dumps({"ble_observations":results,"error":error},ensure_ascii=False))
+    return 0 if result.status == "success" else 1
 
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        )
-
-        address = result.stdout.strip()
-
-        if not address:
-            raise RuntimeError(
-                "No IPv4 address found on the WiFi adapter."
-            )
-
-        interface = ipaddress.ip_interface(address)
-
-        return str(interface.network), str(interface.ip)
-
-    except Exception as e:
-        print(f"Error detecting Wi-Fi network: {e}")
-        return None, None
-
-
-    
-
-def scan_wifi_network(ip_range, interface):
-    """
-    Performs the ARP scan on the given IP range using Scapy.
-    """
-    print(f"[*] Starting Wi-Fi Scan (ARP) on {ip_range}...")
-    try:
-        
-        
-        # 1. Build the ARP request packet
-        arp_request = scp.ARP(pdst=ip_range)
-        
-        # 2. Build the Ethernet broadcast frame
-        broadcast_frame = scp.Ether(dst="ff:ff:ff:ff:ff:ff")
-        
-        # 3. Combine them
-        arp_request_broadcast = broadcast_frame / arp_request
-        
-        # 4. Send and receive (srp) packets, with a 2-second timeout
-        
-        answered_list = scp.srp(
-            arp_request_broadcast,
-            iface=interface,
-            timeout=5,
-            retry=1,
-            verbose=False,
-        )[0]
-
-        
-        clients_list = []
-        for element in answered_list:
-            # element[1] is the response packet
-            client_dict = {"ip": element[1].psrc, "mac": element[1].hwsrc}
-            clients_list.append(client_dict)
-            
-        print(f"[*] Wi-Fi scan complete. Found {len(clients_list)} devices.")
-        return clients_list
-        
-    except Exception as e:
-        print(f"\n[!] An error occurred during the Wi-Fi scan: {e}")
-        print("[!] Please ensure Npcap is installed (on Windows) and the script is run as Administrator.")
-        return []
-
-def scan_available_wifi_networks():
-    """
-    Lists nearby Wi-Fi networks (SSIDs) using the Windows WLAN service.
-    This is different from the ARP scan above, which finds devices on the
-    currently connected LAN.
-    """
-    if platform.system() != "Windows":
-        print("[!] Nearby Wi-Fi network scanning is currently supported on Windows only.")
-        return []
-
-    try:
-        output = subprocess.run(
-            ["netsh", "wlan", "show", "networks", "mode=bssid"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=True,
-        ).stdout
-        networks = []
-        for match in re.finditer(r"^\s*SSID\s+\d+\s*:\s*(.*)$", output, re.MULTILINE):
-            ssid = match.group(1).strip()
-            if ssid and ssid not in networks:
-                networks.append(ssid)
-        print(f"[*] Nearby Wi-Fi scan complete. Found {len(networks)} networks.")
-        return networks
-    except (OSError, subprocess.CalledProcessError) as e:
-        print(f"\n[!] Could not scan nearby Wi-Fi networks: {e}")
-        print("[!] Ensure the Wi-Fi adapter is enabled and the WLAN service is running.")
-        return []
-
-def get_device_hostname(ip_address, results_dict):
-    """
-    Tries to find the hostname of a device using a reverse DNS lookup.
-    This function is designed to be run in a separate thread.
-    """
-    try:
-        # This is the core lookup. It asks the network for the name.
-        hostname, _, _ = socket.gethostbyaddr(ip_address)
-        results_dict[ip_address] = hostname
-    except socket.herror:
-        # 'Host not found' or other error
-        results_dict[ip_address] = "N/A"
-    except Exception:
-        results_dict[ip_address] = "Error"
-
-
-def enrich_wifi_devices_with_hostname(clients_list):
-    """
-    Goes through the list of Wi-Fi devices and tries to find their hostname.
-    
-    This is complex because socket.gethostbyaddr can be VERY slow if a
-    device doesn't respond. We can't do this one-by-one.
-    
-    We will use a simple (non-async) approach for this script.
-    A true high-performance scanner would use an async DNS resolver.
-    """
-    if not clients_list:
-        return []
-        
-    print("[*] Starting Hostname Lookup (Reverse DNS)...")
-    
-    # We will use this to store results
-    hostname_results = {}
-    
-    # We set a *global* timeout for all socket operations
-    # If a lookup takes longer than 0.5 sec, it will fail
-    # This is CRITICAL to make the scan fast.
-    socket.setdefaulttimeout(0.5)
-
-    print(f"[+] Looking up hostname 1 of {len(clients_list)}...", end="\r")
-    
-    # Loop over all clients and try to get their hostname
-    for i, client in enumerate(clients_list):
-        print(f"[+] Looking up hostname {i+1} of {len(clients_list)}...", end="\r")
-        try:
-            hostname, _, _ = socket.gethostbyaddr(client['ip'])
-            client['name'] = hostname
-        except socket.herror:
-            client['name'] = "N/A" # Hostname not found
-        except Exception:
-            client['name'] = "N/A" # Other error (e.g., timeout)
-
-    print("\n[*] Hostname lookup complete.")
-    return clients_list
-
-
-# --- 3. Bluetooth Scan Function ---
-
-async def scan_bluetooth_devices():
-    """
-    Uses the 'bleak' library to scan for nearby Bluetooth LE devices.
-    'async' means this function runs asynchronously.
-    """
-    print("[*] Starting Bluetooth Scan (5 seconds)...")
-    devices_list = []
-    try:
-        # Discover devices for 5 seconds
-        discovered_devices = await bleak.BleakScanner.discover(timeout=5.0)
-        
-        for d in discovered_devices:
-            # We only care about devices that have a name
-            if d.name and d.name != "Unknown":
-                devices_list.append({
-                    "name": d.name,
-                    "mac": d.address
-                })
-                
-        print(f"[*] Bluetooth scan complete. Found {len(devices_list)} named devices.")
-        
-    except bleak.exc.BleakError as e:
-        print(f"\n[!] An error occurred during the Bluetooth scan: {e}")
-        print("[!] Please ensure your computer's Bluetooth is turned ON.")
-    
-    return devices_list
-
-# --- 4. Display Functions ---
-
-def display_wifi_results(clients_list):
-    """
-    Prints a "neat table" of all discovered Wi-Fi devices.
-    (Updated to show Hostname)
-    """
-    # Define column content widths
-    idx_width = 5
-    ip_width = 18
-    mac_width = 17
-    name_width = 28 # This column is now Hostname
-    
-    # Box-drawing characters
-    h, v = "═", "║"
-    tl, tr, bl, br = "╔", "╗", "╚", "╝"
-    tc, bc, lc, rc, c = "╦", "╩", "╠", "╣", "╬"
-    
-    # --- Create the table structure ---
-    top_border = f"{tl}{h*(idx_width+2)}{tc}{h*(ip_width+2)}{tc}{h*(mac_width+2)}{tc}{h*(name_width+2)}{tr}"
-    title = f" LAN Watch: Wi-Fi Network ({len(clients_list)} Devices) "
-    total_inner_width = len(top_border) - 2
-    title_row = f"{v}{title:^{total_inner_width}}{v}"
-    header_sep = f"{lc}{h*(idx_width+2)}{c}{h*(ip_width+2)}{c}{h*(mac_width+2)}{c}{h*(name_width+2)}{rc}"
-    
-    header_idx = f" {'#':^{idx_width}} "
-    header_ip = f" {'IP Address':^{ip_width}} "
-    header_mac = f" {'MAC Address':^{mac_width}} "
-    header_name = f" {'Device Name (Hostname)':^{name_width}} " # Updated Header
-    header_row = f"{v}{header_idx}{v}{header_ip}{v}{header_mac}{v}{header_name}{v}"
-    
-    bottom_border = f"{bl}{h*(idx_width+2)}{bc}{h*(ip_width+2)}{bc}{h*(mac_width+2)}{bc}{h*(name_width+2)}{br}"
-
-    # --- Print the table ---
-    print("\n" + top_border)
-    print(title_row)
-    print(header_sep)
-    print(header_row)
-    print(header_sep)
-
-    if not clients_list:
-        no_devices_msg = "No devices found on the network."
-        print(f"{v}{no_devices_msg:^{total_inner_width}}{v}")
-    else:
-        # Sort the list by IP address
-        try:
-            sorted_clients = sorted(clients_list, key=lambda x: ipaddress.ip_address(x['ip']))
-        except ValueError:
-            sorted_clients = clients_list # Fallback if IP is invalid
-
-        for i, client in enumerate(sorted_clients):
-            # Truncate long names to fit the column
-            name = (client.get('name', "N/A"))[:name_width] # Use .get() for safety
-            
-            # Left-align content
-            idx_str = f" {i+1:<{idx_width}} "
-            ip_str = f" {client['ip']:<{ip_width}} "
-            mac_str = f" {client['mac']:<{mac_width}} "
-            name_str = f" {name:<{name_width}} "
-            
-            print(f"{v}{idx_str}{v}{ip_str}{v}{mac_str}{v}{name_str}{v}")
-            
-    print(bottom_border)
-
-def display_bluetooth_results(clients_list):
-    """
-    Prints a "neat table" of all discovered Bluetooth devices.
-    """
-    # Define column content widths
-    idx_width = 5
-    name_width = 28
-    mac_width = 17
-    
-    # Box-drawing characters
-    h, v = "═", "║"
-    tl, tr, bl, br = "╔", "╗", "╚", "╝"
-    tc, bc, lc, rc, c = "╦", "╩", "╠", "╣", "╬"
-    
-    # --- Create the table structure ---
-    top_border = f"{tl}{h*(idx_width+2)}{tc}{h*(name_width+2)}{tc}{h*(mac_width+2)}{tr}"
-    title = f" LAN Watch: Bluetooth ({len(clients_list)} Devices) "
-    total_inner_width = len(top_border) - 2
-    title_row = f"{v}{title:^{total_inner_width}}{v}"
-    header_sep = f"{lc}{h*(idx_width+2)}{c}{h*(name_width+2)}{c}{h*(mac_width+2)}{rc}"
-    
-    header_idx = f" {'#':^{idx_width}} "
-    header_name = f" {'Device Name':^{name_width}} "
-    header_mac = f" {'MAC Address':^{mac_width}} "
-    header_row = f"{v}{header_idx}{v}{header_name}{v}{header_mac}{v}"
-    
-    bottom_border = f"{bl}{h*(idx_width+2)}{bc}{h*(name_width+2)}{bc}{h*(mac_width+2)}{br}"
-
-    # --- Print the table ---
-    print("\n" + top_border)
-    print(title_row)
-    print(header_sep)
-    print(header_row)
-    print(header_sep)
-
-    if not clients_list:
-        no_devices_msg = "No devices found."
-        print(f"{v}{no_devices_msg:^{total_inner_width}}{v}")
-    else:
-        # Sort the list by name
-        sorted_clients = sorted(clients_list, key=lambda x: x['name'])
-
-        for i, client in enumerate(sorted_clients):
-            # Truncate long names to fit the column
-            name = (client['name'] or "N/A")[:name_width]
-            
-            # Left-align content
-            idx_str = f" {i+1:<{idx_width}} "
-            name_str = f" {name:<{name_width}} "
-            mac_str = f" {client['mac']:<{mac_width}} "
-            
-            print(f"{v}{idx_str}{v}{name_str}{v}{mac_str}{v}")
-            
-    print(bottom_border)
-
-def display_available_wifi_results(networks):
-    """Prints the nearby Wi-Fi network names detected by the wireless adapter."""
-    print("\n" + "=" * 50)
-    print(f"Nearby Wi-Fi Networks ({len(networks)})")
-    print("=" * 50)
-    if not networks:
-        print("No nearby Wi-Fi networks found.")
-    else:
-        for index, ssid in enumerate(networks, start=1):
-            print(f"{index:>3}. {ssid}")
-    print("=" * 50)
-
-
-# --- 5. Main Function ---
-
-async def main():
-    """
-    The main function that runs our entire script.
-    """
-    # --- Step 1: Admin Check ---
-    if not is_admin():
-        print("[ERROR] This script requires administrator/root privileges to run.")
-        print("[INFO] Please close this window and re-launch as Administrator.")
-        sys.exit(1)
-    else:
-        print("[+] Administrator check passed.")
-        
-    # --- Step 2: Find nearby Wi-Fi networks and the connected LAN ---
-    nearby_wifi_networks = scan_available_wifi_networks()
-    display_available_wifi_results(nearby_wifi_networks)
-
-    print("[+] Attempting to find network range automatically...")
-    
-    
-    if platform.system() == "Windows":
-        target_range, wifi_ip = get_wifi_network_info_windows()
-    else:
-        print(
-            "[!] Automatic range finding for Linux/macOS "
-            "not implemented in this script."
-        )
-        target_range, wifi_ip = None, None
-
-    
-    if not target_range:
-        print("[-] Could not automatically determine network range.")
-        sys.exit(1)
-    
-    print(f"[+] Automatically detected network range: {target_range}")
-
-    
-    wifi_interface = next(
-        (
-            iface
-            for iface in scp.conf.ifaces.values()
-            if getattr(iface, "ip", None) == wifi_ip
-        ),
-        None,
-    )
-
-    if wifi_interface is None:
-        print(f"[ERROR] Could not find Scapy interface for {wifi_ip}.")
-        print("[INFO] Check the Scapy interface list and Npcap installation.")
-        sys.exit(1)
-
-    print(f"[+] Selected Wi-Fi interface: {wifi_interface.name}")
-
-    
-    # --- Step 3: Run LAN device scan ---
-    wifi_devices = scan_wifi_network(target_range,wifi_interface)
-    
-    # --- Step 4: Enrich Wi-Fi Data (NEW: Hostname Lookup) ---
-    enriched_wifi_devices = enrich_wifi_devices_with_hostname(wifi_devices)
-    
-    # --- Step 5: Run Bluetooth Scan ---
-    # This is an async function, so we 'await' it
-    bluetooth_devices = await scan_bluetooth_devices()
-    
-    # --- Step 6: Display All Results ---
-    display_wifi_results(enriched_wifi_devices)
-    display_bluetooth_results(bluetooth_devices)
-    
-    print("\n[+] Full scan complete.")
-    input("\nPress Enter to close the scanner...")
 
 if __name__ == "__main__":
-    # This is how we run our 'async' main function
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n[!] Scan interrupted by user. Exiting.")
-        sys.exit(0)
+    raise SystemExit(main())
